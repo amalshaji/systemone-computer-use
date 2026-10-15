@@ -1,0 +1,14 @@
+[project]
+name = "systemone-computer-use"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.14.0",
+    "httpx>=0.27",
+    "mss>=9.0",
+    "pillow>=10.0",
+    "pyautogui>=0.9.54",
+    "pyobjc-framework-applicationservices>=12.2.2",
+    "pyobjc-framework-cocoa>=10.0",
+    "python-dotenv>=1.0",
+]

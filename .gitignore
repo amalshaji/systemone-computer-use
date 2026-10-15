@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Run output: screenshots of the screen and a log of what was done
+runs/
+agent.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+.DS_Store
