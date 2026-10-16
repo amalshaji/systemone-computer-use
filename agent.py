@@ -50,7 +50,7 @@ API_URL = "https://api.typesafe.ai/v1/systemone"
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GENERATE = "write_new_text"
 NO_ELEMENT = "none_of_these"
-TARGETED = ("click", "double_click", "right_click", "type", "scroll_up", "scroll_down")
+TARGETED = ("click", "double_click", "right_click", "type", "scroll_up", "scroll_down", "drag")
 
 log = logging.getLogger("agent")
 
@@ -70,6 +70,7 @@ ACTIONS = {
     "open_app": "Bring an app the goal needs to the front: switches to it if it's in `running_apps`, otherwise launches it. Only when `frontmost_app` is not already that app.",
     "scroll_up": "Scroll the target area up by most of a screen.",
     "scroll_down": "Scroll the target area down by most of a screen, to see new content.",
+    "drag": "Press the mouse on the target, move to `drag_to` while holding the button, and release: move or resize things, sliders, select text, draw a stroke.",
     "wait": "Do nothing this step. Only when something is still loading (`page_loading` is true, or a spinner, progress bar or half-rendered page is visible), never because the next step is unclear.",
 }
 
@@ -321,6 +322,22 @@ def mouse_click(x, y, button="left", count=1):
         time.sleep(0.05)
 
 
+def mouse_drag(x0, y0, x1, y1):
+    """Press at (x0, y0), glide to (x1, y1) with the button held, release."""
+    mouse_move(x0, y0)
+    down = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, (x0, y0), Quartz.kCGMouseButtonLeft)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+    time.sleep(0.05)
+    points, delay = glide_path((x0, y0), (x1, y1))
+    for px, py in points:
+        event = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDragged, (px, py), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        time.sleep(delay)
+    up = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, (x1, y1), Quartz.kCGMouseButtonLeft)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+    time.sleep(0.05)
+
+
 def mouse_scroll(x, y, pixels):
     """Scroll by `pixels` (positive is up) over (x, y), in small steps so it glides."""
     mouse_move(x, y)
@@ -417,6 +434,10 @@ def build_request(model, goal, plan, subgoal_index, texts, apps, steps, history_
             "instructions": "Given `current_subgoal` (part of `goal`), `steps_so_far` and `current_screenshot`, what is the best next action toward `current_subgoal`?",
             "criteria": ACTIONS,
         },
+        "drag_to": {
+            "type": "box",
+            "instructions": "If the next action is dragging, where in `current_screenshot` should the drag end (where the mouse button is released)?",
+        },
         "target": {
             "type": "box",
             "instructions": "The single UI element in `current_screenshot` to click, type into or scroll over next to make progress on `current_subgoal`, given `steps_so_far`.",
@@ -468,12 +489,14 @@ def element_box(element, region):
     }
 
 
-def describe(action, element, box, key):
+def describe(action, element, box, key, end=None):
     """A short name for what an action does, used to spot repeats that have no effect."""
     if action in TARGETED:
         if element:
-            return f"{action} {element['role']} {element['name']!r}"
-        return f"{action} at ({(box['left'] + box['right']) / 2:.2f}, {(box['top'] + box['bottom']) / 2:.2f})"
+            what = f"{action} {element['role']} {element['name']!r}"
+        else:
+            what = f"{action} at ({(box['left'] + box['right']) / 2:.2f}, {(box['top'] + box['bottom']) / 2:.2f})"
+        return f"{what} to ({end[0]:.2f}, {end[1]:.2f})" if action == "drag" and end else what
     if action == "key":
         return f"key {key}"
     return None
@@ -603,7 +626,7 @@ def top(probabilities, n=3):
     return ", ".join(f"{k}={v:.2f}" for k, v in ranked)
 
 
-def execute(action, x, y, text, key, app, launcher_hotkey, page_height):
+def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end=None):
     if action == "click" or action == "type":
         mouse_click(x, y)
     elif action == "double_click":
@@ -650,6 +673,8 @@ def execute(action, x, y, text, key, app, launcher_hotkey, page_height):
                 f"frontmost is {front.localizedName() if front else None!r}"
             )
         ensure_window(app)
+    elif action == "drag":
+        mouse_drag(x, y, *drag_end)
     elif action in ("scroll_up", "scroll_down"):
         # Most of a screen: each step shows new content, with a little overlap for context.
         amount = int(page_height * 0.8)
@@ -757,6 +782,8 @@ def run(args):
             log.info(f"  screen unchanged after two waits; taking next most likely action")
         jev_box = answers["target"]["box"]
         key = answers["key"]["choice"]
+        db = answers["drag_to"]["box"]
+        end = ((db["left"] + db["right"]) / 2, (db["top"] + db["bottom"]) / 2)  # drag release, fractions
         # Targets in Jev's order of preference: elements (exact position from the accessibility
         # tree), with its box on the screenshot taking the place of none_of_these.
         if "element" in answers:
@@ -766,15 +793,15 @@ def run(args):
             targets = [None]
         element = targets[0]
         box = element_box(element, region) if element else jev_box
-        if describe(action, element, box, key) in no_effect:
+        if describe(action, element, box, key, end) in no_effect:
             # Already tried on this page with no effect: take Jev's next choice that hasn't been.
             options = [(action, t) for t in targets[1:]] + [
                 (a, targets[0]) for a in sorted(probabilities, key=probabilities.get, reverse=True) if a != action
             ]
             for alt_action, alt_element in options:
                 alt_box = element_box(alt_element, region) if alt_element else jev_box
-                if describe(alt_action, alt_element, alt_box, key) not in no_effect:
-                    log.info(f"  {describe(action, element, box, key)} changed nothing before; trying {describe(alt_action, alt_element, alt_box, key) or alt_action}")
+                if describe(alt_action, alt_element, alt_box, key, end) not in no_effect:
+                    log.info(f"  {describe(action, element, box, key, end)} changed nothing before; trying {describe(alt_action, alt_element, alt_box, key, end) or alt_action}")
                     action, element, box = alt_action, alt_element, alt_box
                     break
         fx, fy = (box["left"] + box["right"]) / 2, (box["top"] + box["bottom"]) / 2
@@ -793,10 +820,12 @@ def run(args):
             "go_to_url": f"url={text!r}",
             "type": f"text={text!r} into {via} at ({x:.0f},{y:.0f})",
             "wait": "",
+            "drag": f"from {via} at ({x:.0f},{y:.0f}) to ({region['left'] + end[0] * region['width']:.0f},{region['top'] + end[1] * region['height']:.0f})",
         }.get(action, f"on {via} at ({x:.0f},{y:.0f})")
         log.info(f"  -> {action} {detail}  (p={probabilities[action]:.2f})")
 
-        execute(action, x, y, text, key, app, args.launcher_hotkey, region["height"])
+        drag_end = (region["left"] + end[0] * region["width"], region["top"] + end[1] * region["height"])
+        execute(action, x, y, text, key, app, args.launcher_hotkey, region["height"], drag_end)
         # A page that's still loading shows the old content; wait for it before the next screenshot.
         time.sleep(0.3)
         loading_front = frontmost_app()
@@ -805,9 +834,11 @@ def run(args):
             log.info("  waited for the page to load" if loaded else "  page still loading after 10s; continuing")
 
         step = {"step": n, "subgoal": sub + 1, "action": action, "window_before": title,
-                "did": describe(action, element, box, key)}
+                "did": describe(action, element, box, key, end)}
         if action in TARGETED:
             step["at_fraction_of_screen"] = {"x": round(fx, 3), "y": round(fy, 3)}
+            if action == "drag":
+                step["to_fraction_of_screen"] = {"x": round(end[0], 3), "y": round(end[1], 3)}
             if element:
                 step["target"] = f"{element['role']} {element['name']!r}"
         if action in ("type", "go_to_url"):

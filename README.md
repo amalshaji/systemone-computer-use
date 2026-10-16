@@ -13,8 +13,8 @@ Jev can't write text. It only picks options with probabilities, answers yes/no, 
 - **Planning** — a text model (Qwen 3.8 27B on Cerebras) breaks the goal into ordered sub-goals.
 - **Each step** — the agent screenshots the target app's window and reads its buttons, links, fields and visible text from the macOS accessibility tree. Jev gets both, plus the plan and every step taken so far, and decides:
   - is the current sub-goal done?
-  - which action next (click, type, go to URL, key, open app, scroll, wait)?
-  - which element to act on, with a box on the screenshot as fallback?
+  - which action next (click, type, go to URL, key, open app, scroll, drag, wait)?
+  - which element to act on, with a box on the screenshot as fallback (and for a drag, where to release)?
 - **Text** — when Jev decides something must be typed, the text model writes it.
 - **Answer** — when the plan is done, the text model reports what was found.
 
