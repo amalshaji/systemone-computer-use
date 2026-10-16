@@ -37,6 +37,9 @@ import pyautogui
 import Quartz
 from AppKit import (
     NSApplicationActivateAllWindows,
+    NSPasteboard,
+    NSPasteboardItem,
+    NSPasteboardTypeString,
     NSApplicationActivationPolicyRegular,
     NSBundle,
     NSRunningApplication,
@@ -79,11 +82,26 @@ KEYS = {
     "tab": "Move focus to the next field",
     "escape": "Close a dialog or cancel",
     "backspace": "Delete the previous character",
+    "delete": "Delete forward",
+    "space": "Space (also plays/pauses media, scrolls pages)",
     "cmd+a": "Select all",
+    "cmd+c": "Copy",
+    "cmd+x": "Cut",
+    "cmd+v": "Paste",
+    "cmd+z": "Undo",
+    "cmd+s": "Save",
+    "cmd+f": "Find",
+    "cmd+n": "New window or document",
+    "cmd+t": "New tab",
+    "cmd+w": "Close the tab or window",
     "cmd+l": "Focus the browser address bar",
     "cmd+space": "Open the app launcher (Spotlight, Raycast...)",
     "up": "Arrow up",
     "down": "Arrow down",
+    "left": "Arrow left",
+    "right": "Arrow right",
+    "pageup": "Page up",
+    "pagedown": "Page down",
 }
 
 
@@ -149,6 +167,49 @@ def hotkey(*keys):
         flags &= ~MODIFIERS[m][0]
         post_key(MODIFIERS[m][1], False, flags)
     release_modifiers()
+
+
+def type_text(text):
+    """Type any text, Unicode included: pyautogui.write silently drops non-ASCII (•, ₹, é, emoji)."""
+    for i, line in enumerate(text.split("\n")):
+        if i:
+            post_key(keyboardMapping["return"], True, 0)
+            post_key(keyboardMapping["return"], False, 0)
+        for ch in line:
+            for down in (True, False):
+                event = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+                Quartz.CGEventKeyboardSetUnicodeString(event, len(ch.encode("utf-16-le")) // 2, ch)
+                Quartz.CGEventSetFlags(event, 0)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            time.sleep(0.012)
+
+
+def paste_text(text):
+    """Put text in via the clipboard (instant for long text), then restore what was on it."""
+    board = NSPasteboard.generalPasteboard()
+    saved = []
+    for item in board.pasteboardItems() or []:
+        copy = NSPasteboardItem.alloc().init()
+        for kind in item.types():
+            data = item.dataForType_(kind)
+            if data is not None:
+                copy.setData_forType_(data, kind)
+        saved.append(copy)
+    board.clearContents()
+    board.setString_forType_(text, NSPasteboardTypeString)
+    hotkey("command", "v")
+    time.sleep(0.3)  # let the app read the clipboard before it's restored
+    board.clearContents()
+    if saved:
+        board.writeObjects_(saved)
+
+
+def enter_text(text):
+    """Paste long or multi-line text; type short text (search boxes react to keystrokes)."""
+    if len(text) > 40 or "\n" in text:
+        paste_text(text)
+    else:
+        type_text(text)
 
 
 def release_modifiers():
@@ -415,8 +476,8 @@ def build_request(model, goal, plan, subgoal_index, texts, apps, steps, history_
     state["current_window_title"] = title
     state["page_loading"] = loading  # the browser is still loading the page; what's shown may be the previous page
     state["page_text"] = page_text  # the window's visible text, read from the accessibility tree
-    # Actions already tried on this page that changed nothing on screen: don't repeat them.
-    state["tried_without_effect"] = sorted(tried)
+    # Actions already taken from this same screen earlier; they led back here, so don't repeat them.
+    state["already_tried_from_this_screen"] = sorted(tried)
     if texts:
         state["available_text"] = texts
 
@@ -502,6 +563,31 @@ def describe(action, element, box, key, end=None):
     return None
 
 
+def signature(action, element, box, key, end):
+    """What an action does, comparable across steps (None for actions that aren't loop-checked)."""
+    if action not in TARGETED and action not in ("key", "go_to_url"):
+        return None
+    return {
+        "action": action,
+        "name": f"{element['role']} {element['name']}" if element else None,
+        "pos": ((box["left"] + box["right"]) / 2, (box["top"] + box["bottom"]) / 2) if action in TARGETED else None,
+        "key": key if action == "key" else None,
+        "end": end if action == "drag" else None,
+    }
+
+
+def same_action(a, b, tol=0.03):
+    """Whether two signatures are the same action; positions match within `tol` (Jev's boxes jitter)."""
+    if a is None or b is None or a["action"] != b["action"] or a["key"] != b["key"]:
+        return False
+    if a["action"] in ("scroll_up", "scroll_down"):
+        return True  # scrolling anywhere in the window does the same thing
+    close = lambda p, q: p is None or q is None or (abs(p[0] - q[0]) <= tol and abs(p[1] - q[1]) <= tol)
+    if a["name"] and b["name"]:
+        return a["name"] == b["name"] and close(a["end"], b["end"])
+    return close(a["pos"], b["pos"]) and close(a["end"], b["end"])
+
+
 def ask_jev(client, body):
     resp = client.post(API_URL, json=body)
     if resp.is_error:
@@ -513,21 +599,27 @@ TEXT_SYSTEM = "You write the text a computer-use agent types into an input field
 
 
 def cerebras_text(client, model, prompt, image, system=TEXT_SYSTEM):
-    """One Cerebras attempt; returns None when rate limited so the caller can fall back."""
+    """One Cerebras attempt; returns None when it's unavailable (rate limit, server error,
+    timeout, connection drop) so the caller can fall back."""
     content = [{"type": "text", "text": prompt}]
     if image is not None:
         content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(image).decode()}})
-    resp = client.post(CEREBRAS_URL, json={
-        "model": model,
-        "reasoning_effort": "medium",
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
-    })
-    if resp.status_code == 429:
+    try:
+        resp = client.post(CEREBRAS_URL, json={
+            "model": model,
+            "reasoning_effort": "medium",
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
+        })
+    except httpx.TransportError as e:  # timeouts, dropped connections
+        log.info(f"  {model} unreachable ({type(e).__name__})")
+        return None
+    if resp.status_code == 429 or resp.status_code >= 500:
+        log.info(f"  {model} unavailable (HTTP {resp.status_code})")
         return None
     if resp.is_error:
-        raise RuntimeError(f"Cerebras {model} {resp.status_code}: {resp.text}")
+        raise RuntimeError(f"Cerebras {model} {resp.status_code}: {resp.text[:300]}")
     choice = resp.json()["choices"][0]
     if choice["finish_reason"] != "stop":
         raise RuntimeError(f"{model} stopped with {choice['finish_reason']}")
@@ -553,15 +645,15 @@ def haiku_text(client, prompt, image, system=TEXT_SYSTEM):
 def write_text(cerebras, claude, prompt, image, system=TEXT_SYSTEM):
     """Qwen on Cerebras, then gpt-oss on Cerebras, then Claude Haiku.
 
-    Each step down happens only on a rate limit. gpt-oss is text-only, so it gets
-    no screenshot, just the prompt.
+    Each step down happens only when a model is unavailable. gpt-oss is text-only,
+    so it gets no screenshot, just the prompt.
     """
     text = cerebras_text(cerebras, "qwen-3.8-27b", prompt, image, system)
     if text is None:
-        log.info("  qwen-3.8-27b rate limited; using gpt-oss-120b (no screenshot)")
+        log.info("  using gpt-oss-120b (no screenshot)")
         text = cerebras_text(cerebras, "gpt-oss-120b", prompt, None, system)
     if text is None:
-        log.info("  gpt-oss-120b rate limited; using claude-haiku-5-5")
+        log.info("  using claude-haiku-5-5")
         text = haiku_text(claude, prompt, image, system)
     return text
 
@@ -575,9 +667,13 @@ PLAN_SYSTEM = (
 )
 
 
-def make_plan(cerebras, claude, goal):
+def make_plan(cerebras, claude, goal, apps):
     """Ordered sub-goals for the goal, written by the text model."""
-    prompt = f"Today: {time.strftime('%A %d %B %Y')}\nGoal: {goal}"
+    prompt = (
+        f"Today: {time.strftime('%A %d %B %Y')}\n"
+        f"Goal: {goal}\n"
+        f"Installed apps (use only these, or websites in a browser): {', '.join(apps)}"
+    )
     lines = write_text(cerebras, claude, prompt, None, PLAN_SYSTEM).splitlines()
     plan = [re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip() for line in lines]
     return [line for line in plan if line][:10] or [goal]
@@ -587,16 +683,18 @@ ANSWER_SYSTEM = (
     "You report the result of a computer-use task to the person who asked for it. Using the page text "
     "and screenshot, answer their goal in one to three short sentences with the specific details found "
     "(names, prices, dates, scores, addresses). If the goal was only an action, say briefly what was done. "
-    "Plain text, no preamble."
+    "Be accurate: if a sub-goal the goal depends on was skipped, say the goal was not completed and what is "
+    "missing. Only describe what the page text or screenshot actually shows. Plain text, no preamble."
 )
 
 
-def answer_goal(cerebras, claude, goal, plan, steps, title, page_text, image):
+def answer_goal(cerebras, claude, goal, plan, results, steps, title, page_text, image):
     """What the run found or did, written for the user."""
+    outcome = "\n".join(f"  {i}. {g}: {r}" for i, (g, r) in enumerate(zip(plan, results), 1))
     prompt = (
         f"Today: {time.strftime('%A %d %B %Y')}\n"
         f"Goal: {goal}\n"
-        f"Plan: {json.dumps(plan)}\n"
+        f"Sub-goals and results (done = confirmed on screen, skipped = gave up on it):\n{outcome}\n"
         f"Steps taken: {json.dumps(steps)}\n"
         f"Current window title: {title}\n"
         f"Visible page text:\n{page_text}"
@@ -626,7 +724,11 @@ def top(probabilities, n=3):
     return ", ".join(f"{k}={v:.2f}" for k, v in ranked)
 
 
-def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end=None):
+class AppOpenFailed(RuntimeError):
+    """open_app didn't bring the app to the front; the run carries on and Jev chooses again."""
+
+
+def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end=None, address_field=None):
     if action == "click" or action == "type":
         mouse_click(x, y)
     elif action == "double_click":
@@ -636,11 +738,17 @@ def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end
     if action == "type":
         hotkey("command", "a")
         release_modifiers()
-        pyautogui.write(text, interval=0.02)
+        enter_text(text)
     elif action == "go_to_url":
-        hotkey("command", "l")
+        if address_field:
+            # Click the browser's own address field: pages can swallow cmd+L (web apps with
+            # their own shortcuts), but not a click on the browser's toolbar.
+            mouse_click(address_field["left"] + address_field["width"] / 2, address_field["top"] + address_field["height"] / 2)
+            hotkey("command", "a")
+        else:
+            hotkey("command", "l")
         release_modifiers()
-        pyautogui.write(text, interval=0.02)
+        type_text(text)
         pyautogui.press("enter")
     elif action == "key":
         # pyautogui silently ignores "cmd" on macOS; it only knows "command".
@@ -649,7 +757,7 @@ def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end
         # Already running: switch to its window rather than launching it again.
         log.info(f"  {app!r} is already running; focusing its window")
         if not focus(app):
-            raise RuntimeError(f"Could not bring {app!r} to the front")
+            raise AppOpenFailed(f"Could not bring {app!r} to the front")
         ensure_window(app)
     elif action == "open_app":
         before = floating_windows()
@@ -657,9 +765,9 @@ def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end
         # Never type unless a launcher (Spotlight, Raycast, Alfred...) really opened,
         # or the text lands in whatever has focus.
         if not wait_for(lambda: floating_windows() - before):
-            raise RuntimeError(f"{launcher_hotkey} did not open an app launcher; not typing the app name")
+            raise AppOpenFailed(f"{launcher_hotkey} did not open an app launcher; not typing the app name")
         release_modifiers()
-        pyautogui.write(app, interval=0.02)
+        type_text(app)
         time.sleep(1.0)  # let the launcher's results load before picking the top one
         pyautogui.press("enter")
         if not wait_for(lambda: frontmost_is(app), timeout=5.0):
@@ -668,7 +776,7 @@ def execute(action, x, y, text, key, app, launcher_hotkey, page_height, drag_end
                 pyautogui.press("escape")  # close the launcher so it stops taking keystrokes
         if not frontmost_is(app) and not focus(app):
             front = frontmost_app()
-            raise RuntimeError(
+            raise AppOpenFailed(
                 f"The launcher did not bring {app!r} to the front; "
                 f"frontmost is {front.localizedName() if front else None!r}"
             )
@@ -701,10 +809,12 @@ def run(args):
     log.info(f"saving step screenshots to {run_dir}/")
     own_app = frontmost_app()  # the terminal running this script
     log.info(f"launched from {own_app.localizedName() if own_app else None!r}; never typing into it")
-    plan = make_plan(cerebras, claude, args.goal)
+    plan = make_plan(cerebras, claude, args.goal, apps)
     log.info("plan:\n" + "\n".join(f"  {i}. {g}" for i, g in enumerate(plan, 1)))
     sub, sub_steps = 0, 0  # current sub-goal, and steps spent on it
-    no_effect, no_effect_page = set(), None  # actions that changed nothing, on the current page
+    results = []  # per sub-goal: "done" or "skipped"
+    sigs = []  # signature of each step's action, aligned with `steps` and `history_images`
+    failed_apps = set()  # apps open_app couldn't bring to the front
 
     for n in range(1, args.max_steps + 1):
         if target_app and not frontmost_is(target_app):
@@ -727,29 +837,37 @@ def run(args):
             f.write(current)
         if steps:
             steps[-1]["window_after"] = title
-            changed = title != steps[-1]["window_before"] or screen_changed(history_images[-1][1], current)
-            steps[-1]["screen_changed"] = changed
-            if not changed and steps[-1].get("did"):
-                no_effect.add(steps[-1]["did"])
-        if title != no_effect_page:
-            no_effect, no_effect_page = set(), title
+            steps[-1]["screen_changed"] = title != steps[-1]["window_before"] or screen_changed(history_images[-1][1], current)
+        # Actions taken earlier from this same screen (same title, same look) led back here, whether
+        # they changed nothing or went round a loop (menu, dialog, close...). Don't repeat them.
+        tried_steps = [i for i in range(max(0, len(steps) - 12), len(steps))
+                       if sigs[i] and steps[i]["window_before"] == title and not screen_changed(history_images[i][1], current)]
+        tried = {steps[i]["did"] for i in tried_steps}
+        is_tried = lambda sig: any(same_action(sig, sigs[i]) for i in tried_steps)
         recent = history_images[-args.history_images:] if args.history_images else []
         loading = bool(front) and ax.page_loading(front.processIdentifier())
         body = build_request(args.model, args.goal, plan, sub, texts, apps, steps, recent, current, title,
-                             element_labels, loading, page_text, no_effect)
+                             element_labels, loading, page_text, tried)
         answers = ask_jev(client, body)
 
         done = answers["done"]["noul"]
+        in_own_terminal = own_app and front and front.processIdentifier() == own_app.processIdentifier()
+        if in_own_terminal and done >= args.done_threshold:
+            # The terminal shows this agent's log, goal text included: nothing there proves a sub-goal.
+            log.info(f"  ignoring 'done' ({done:.2f}) judged from the agent's own terminal")
+            done = 0.0
         log.info(f"[step {n} | sub-goal {sub + 1}/{len(plan)}] front={body['state']['frontmost_app']!r} title={title!r} elements={len(elements)} text={len(page_text)}ch done={done:.2f}  action: {top(answers['action']['probabilities'])}")
         if done >= args.done_threshold or sub_steps >= args.subgoal_steps:
             if done >= args.done_threshold:
                 log.info(f"  sub-goal {sub + 1} done: {plan[sub]}")
             else:
                 log.info(f"  sub-goal {sub + 1} not done after {sub_steps} steps; moving on: {plan[sub]}")
+            results.append("done" if done >= args.done_threshold else "skipped")
             sub, sub_steps = sub + 1, 0
             if sub == len(plan):
-                log.info("Goal reached." if done >= args.done_threshold else "Plan finished.")
-                log.info(f"Answer: {answer_goal(cerebras, claude, args.goal, plan, steps, title, page_text, current)}")
+                log.info("Goal reached." if "skipped" not in results else f"Plan finished; skipped sub-goals: "
+                         + ", ".join(str(i) for i, r in enumerate(results, 1) if r == "skipped"))
+                log.info(f"Answer: {answer_goal(cerebras, claude, args.goal, plan, results, steps, title, page_text, current)}")
                 return
             continue  # judge the same screen against the next sub-goal
 
@@ -760,21 +878,10 @@ def run(args):
             and not screen_changed(history_images[-2][1], current)
         )
         keyboard = ("type", "key", "go_to_url")
-        if action in keyboard and own_app and front and front.processIdentifier() == own_app.processIdentifier():
+        if action in keyboard and in_own_terminal:
             # Keystrokes here would land in the terminal running the agent (and enter would run them).
             action = max((a for a in probabilities if a not in keyboard), key=probabilities.get)
             log.info(f"  not typing into {own_app.localizedName()!r} (runs the agent); taking {action!r} instead")
-        recent = steps[-4:]
-        cycling = (
-            len(recent) == 4
-            and recent[0]["action"] == recent[2]["action"] != recent[1]["action"] == recent[3]["action"]
-            and all(st.get("window_before") == title for st in recent)
-        )
-        if cycling and action in (recent[0]["action"], recent[1]["action"]):
-            # Going back and forth (scroll up, down, up, down...) on the same page gets nowhere.
-            loop = (recent[0]["action"], recent[1]["action"])
-            action = max((a for a in probabilities if a not in loop), key=probabilities.get)
-            log.info(f"  {loop[0]}/{loop[1]} repeating on the same page; taking {action!r} instead")
         if action == "wait" and stuck:
             # Jev falls back to waiting when unsure. Waiting is fine while the screen changes
             # (a command printing output); two waits on an unchanged screen means stuck.
@@ -789,25 +896,30 @@ def run(args):
         if "element" in answers:
             ranked = sorted(answers["element"]["probabilities"].items(), key=lambda kv: kv[1], reverse=True)
             targets = [None if eid == NO_ELEMENT else elements[int(eid[1:]) - 1] for eid, _ in ranked]
+            # Stand-ins for a repeated action: only targets Jev itself found plausible.
+            plausible = [t for t, (_, p) in zip(targets, ranked) if p >= 0.15]
         else:
-            targets = [None]
+            targets, plausible = [None], [None]
         element = targets[0]
         box = element_box(element, region) if element else jev_box
-        if describe(action, element, box, key, end) in no_effect:
-            # Already tried on this page with no effect: take Jev's next choice that hasn't been.
-            options = [(action, t) for t in targets[1:]] + [
+        if is_tried(signature(action, element, box, key, end)):
+            # Already done from this same screen and it led back here: take Jev's next choice that hasn't been.
+            options = [(action, t) for t in plausible if t is not targets[0]] + [
                 (a, targets[0]) for a in sorted(probabilities, key=probabilities.get, reverse=True) if a != action
             ]
             for alt_action, alt_element in options:
                 alt_box = element_box(alt_element, region) if alt_element else jev_box
-                if describe(alt_action, alt_element, alt_box, key, end) not in no_effect:
-                    log.info(f"  {describe(action, element, box, key, end)} changed nothing before; trying {describe(alt_action, alt_element, alt_box, key, end) or alt_action}")
+                if not is_tried(signature(alt_action, alt_element, alt_box, key, end)):
+                    log.info(f"  {describe(action, element, box, key, end)} was already tried from this screen; trying {describe(alt_action, alt_element, alt_box, key, end) or alt_action}")
                     action, element, box = alt_action, alt_element, alt_box
                     break
         fx, fy = (box["left"] + box["right"]) / 2, (box["top"] + box["bottom"]) / 2
         x, y = region["left"] + fx * region["width"], region["top"] + fy * region["height"]
         via = f"{element['role']} {element['name']!r}" if element else "box on screenshot"
         app = answers["app"]["choice"]
+        if app in failed_apps:
+            app_probs = answers["app"]["probabilities"]
+            app = max((a for a in app_probs if a not in failed_apps), key=app_probs.get)
         text = None
         if action in ("type", "go_to_url"):
             choice = answers["text"]["choice"]
@@ -825,7 +937,15 @@ def run(args):
         log.info(f"  -> {action} {detail}  (p={probabilities[action]:.2f})")
 
         drag_end = (region["left"] + end[0] * region["width"], region["top"] + end[1] * region["height"])
-        execute(action, x, y, text, key, app, args.launcher_hotkey, region["height"], drag_end)
+        address_field = next((e for e in elements if e["role"] in ("text field", "combo box", "search field")
+                              and re.search(r"address", e["name"], re.I)), None)
+        failure = None
+        try:
+            execute(action, x, y, text, key, app, args.launcher_hotkey, region["height"], drag_end, address_field)
+        except AppOpenFailed as e:
+            failure = str(e)
+            failed_apps.add(app)
+            log.info(f"  {failure}; continuing")
         # A page that's still loading shows the old content; wait for it before the next screenshot.
         time.sleep(0.3)
         loading_front = frontmost_app()
@@ -847,9 +967,13 @@ def run(args):
             step["key"] = key
         if action == "open_app":
             step["app"] = app
-            target_app = app
+            if failure:
+                step["failed"] = failure
+            else:
+                target_app = app
         steps.append(step)
         history_images.append((n, current))
+        sigs.append(signature(action, element, box, key, end))
         sub_steps += 1
         time.sleep(args.wait)
 
